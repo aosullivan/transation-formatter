@@ -1,8 +1,9 @@
-transformers>=4.30.0
+transformers>=4.36.0
 torch>=2.0.0
 markdown
-logging
 reportlab
 fpdf>=1.7.2
-accelerate>=0.3.0
-python-dotenv
+accelerate>=0.25.0
+python-dotenv>=1.0.0
+psutil>=5.9.0
+huggingface-hub>=0.20.0
