@@ -1,21 +1,25 @@
 import torch
 import os
 import logging
+import shutil
 from time import time
 from pathlib import Path
-from typing import Optional
+from typing import Optional, Dict, Tuple
 from dotenv import load_dotenv
-from huggingface_hub import login
+from huggingface_hub import login, scan_cache_dir
 from transformers import pipeline, AutoTokenizer, AutoModelForCausalLM
+
+# Add a model cache at module level
+_MODEL_CACHE: Dict[str, tuple] = {}  # {model_name: (tokenizer, model, pipe)}
 
 # Load environment variables at module level
 def get_project_root() -> Path:
     return Path(__file__).parent.resolve()
 
-# Load .env file if HF_TOKEN not in environment
+# Load .env file if 'HF_TOKEN' not in environment
 if 'HF_TOKEN' not in os.environ:
     env_path = get_project_root() / '.env'
-    if env_path.exists():
+    if (env_path.exists()):
         load_dotenv(str(env_path))
 
 HTML_CONVERSION_PROMPT = """Convert the following text from a Gutenberg.org text file into valid, well-formed HTML. Follow these formatting rules strictly to produce clean, semantic HTML output. Use the text’s structure (e.g., blank lines, indentation, prefixes) to determine the correct tags.
@@ -67,85 +71,70 @@ INSTRUCTIONS:
 - Return only valid HTML. Do not include explanations, comments, or text outside the HTML structure.
 - If a line’s purpose is unclear, wrap it in <p> tags as a default."""
 
+def get_hf_cache_dir() -> Path:
+    """Get the Hugging Face cache directory."""
+    return Path.home() / '.cache' / 'huggingface'
+
+class ModelManager:
+    """Singleton class to manage model loading and caching."""
+    _instances: Dict[str, Tuple[AutoTokenizer, AutoModelForCausalLM, pipeline]] = {}
+    _logger = logging.getLogger('llm_inference')
+
+    @classmethod
+    def get_model(cls, model_name: str, token: str) -> Tuple[AutoTokenizer, AutoModelForCausalLM, pipeline]:
+        if model_name not in cls._instances:
+            cls._logger.info(f"Loading model {model_name} for the first time")
+            tokenizer = AutoTokenizer.from_pretrained(model_name, token=token)
+            if tokenizer.pad_token is None:
+                tokenizer.pad_token = tokenizer.eos_token
+
+            model = AutoModelForCausalLM.from_pretrained(
+                model_name,
+                token=token,
+                torch_dtype=torch.float16
+            )
+
+            pipe = pipeline(
+                "text-generation",
+                model=model,
+                tokenizer=tokenizer,
+                truncation=True,
+                padding=True,
+                pad_token_id=tokenizer.pad_token_id
+            )
+            cls._instances[model_name] = (tokenizer, model, pipe)
+            cls._logger.info(f"Model {model_name} loaded and cached in memory")
+
+        return cls._instances[model_name]
+
 class LLMInference:
     def __init__(self, model_name: str, token: Optional[str] = None):
-        self.logger = logging.getLogger('proofreader')
+        self.logger = logging.getLogger('llm_inference')
         self.model_name = model_name
         self.device = "mps" if torch.backends.mps.is_available() else "cpu"
         self.logger.info(f"Initializing LLM with model: {model_name} on device: {self.device}")
-        # Try token in this order: passed token -> env var
+        
         self.token = token or os.getenv('HF_TOKEN')
-        
         if not self.token:
-            raise ValueError(
-                "HuggingFace token not found. Tried:\n"
-                "1. Passed token parameter\n"
-                "2. Environment variable HF_TOKEN\n"
-                "3. .env file in project root\n"
-                "Please provide a token using one of these methods."
-            )
+            raise ValueError("HuggingFace token not found")
         
-        # Login to HuggingFace
         login(self.token)
-        self.tokenizer = None
-        self.model = None
-        self.pipe = None
         
-    def load_model(self):
-        """Load the model and tokenizer."""
-        try:
-            self.logger.info(f"Loading model and tokenizer: {self.model_name}")
-            self.tokenizer = AutoTokenizer.from_pretrained(
-                self.model_name,
-                token=self.token
-            )
-            # Set padding token to eos token if not set
-            if self.tokenizer.pad_token is None:
-                self.tokenizer.pad_token = self.tokenizer.eos_token
-                
-            self.model = AutoModelForCausalLM.from_pretrained(
-                self.model_name,
-                token=self.token,
-                torch_dtype=torch.float16
-            )
-            
-            # Configure pipeline with explicit padding settings
-            self.pipe = pipeline(
-                "text-generation",
-                model=self.model,
-                tokenizer=self.tokenizer,
-                truncation=True,
-                device=self.device,
-                padding=True,
-                pad_token_id=self.tokenizer.pad_token_id
-            )
-            self.logger.info("Model and tokenizer loaded successfully")
-        except Exception as e:
-            self.logger.error(f"Failed to load model: {str(e)}")
-            raise
-    
+        # Get model from singleton manager
+        self.tokenizer, self.model, self.pipe = ModelManager.get_model(model_name, self.token)
+
     def cleanup(self):
-        """Clean up resources."""
-        del self.pipe
-        del self.model
-        del self.tokenizer
-        self.pipe = None
-        self.model = None
-        self.tokenizer = None
+        """Cleanup GPU memory but keep model loaded."""
         torch.cuda.empty_cache() if torch.cuda.is_available() else None
         torch.mps.empty_cache() if torch.backends.mps.is_available() else None
-    
+
     def run_inference(self, text: str) -> str:
-        """Run inference on the given text. Raises exceptions on any error."""
         if not text or not text.strip():
             raise ValueError("Empty text provided for inference")
-            
-        if self.pipe is None:
-            self.load_model()
         
         self.logger.info(f"Running inference on text of length: {len(text)}")
         start_time = time()
-            
+        
         prompt = HTML_CONVERSION_PROMPT.format(text=text)
         result = self.pipe(
             prompt,

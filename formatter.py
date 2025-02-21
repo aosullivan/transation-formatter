@@ -58,9 +58,9 @@ def setup_logging(log_dir: str = "logs") -> logging.Logger:
     """Setup logging with a single log file."""
     Path(log_dir).mkdir(exist_ok=True)
     timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
-    log_file = f"{log_dir}/proofreader_{timestamp}.log"
+    log_file = f"{log_dir}/formatter_{timestamp}.log"
     
-    logger = logging.getLogger('proofreader')
+    logger = logging.getLogger('formatter')
     logger.setLevel(logging.DEBUG)
     logger.handlers.clear()
     
