@@ -1,10 +1,9 @@
-import math
-import html
+import re
 import logging
 import os
 from datetime import datetime, timedelta
 from pathlib import Path
-from typing import Dict, Tuple, Optional
+from typing import Dict, Tuple, Optional, Any
 from statistics import mean
 from time import time
 import torch
@@ -14,6 +13,9 @@ import sys
 import psutil
 from llm_inference import LLMInference
 import re
+from collections import deque
+import argparse
+import json
 
 def calculate_optimal_workers() -> int:
     """Calculate optimal batch size based on available memory."""
@@ -28,31 +30,81 @@ class ProcessingConfig:
     batch_size: int = calculate_optimal_workers()
     model_name: str = "meta-llama/Llama-3.2-3B-Instruct"
     timeout: int = 300
+    output_format: str = "md"  # Changed from html to md
+
+@dataclass
+class ProcessingState:
+    """State information for processing job."""
+    input_file: str
+    output_file: str
+    total_chunks: int
+    completed_chunks: Dict[int, str]  # chunk_idx -> content
+    start_time: float
+    config: Dict[str, Any]
+    
+    @classmethod
+    def load(cls, state_file: Path) -> 'ProcessingState':
+        data = json.loads(state_file.read_text())
+        return cls(**data)
+    
+    def save(self, state_file: Path):
+        data = {
+            'input_file': self.input_file,
+            'output_file': self.output_file,
+            'total_chunks': self.total_chunks,
+            'completed_chunks': self.completed_chunks,
+            'start_time': self.start_time,
+            'config': self.config
+        }
+        state_file.write_text(json.dumps(data))
 
 class ChunkTimeTracker:
-    def __init__(self, total_chunks: int, num_workers: int):
+    def __init__(self, total_chunks: int, num_workers: int, history_size: int = 20):
         self.total_chunks = total_chunks
         self.num_workers = max(1, min(num_workers, total_chunks))
         self.completed_chunks = 0
-        self.processing_times = []
+        self.processing_times = deque(maxlen=history_size)
         self.start_time = time()
+        self.last_estimate = None
         
     def add_chunk_time(self, processing_time: float) -> Tuple[float, float, float]:
+        """Add a new processing time and calculate estimates."""
         self.processing_times.append(processing_time)
         self.completed_chunks += 1
         
-        avg_time = mean(self.processing_times[-self.num_workers:] 
-                       if len(self.processing_times) >= self.num_workers 
-                       else self.processing_times)
-        effective_rate = avg_time / min(self.num_workers, self.total_chunks)
+        # Calculate weighted moving average (recent times weighted more heavily)
+        weights = [1 + (i/10) for i in range(len(self.processing_times))]
+        weighted_times = [t * w for t, w in zip(self.processing_times, weights)]
+        avg_time = sum(weighted_times) / sum(weights)
+        
+        # Calculate trend (are times increasing or decreasing?)
+        if len(self.processing_times) >= 2:
+            recent_avg = mean(list(self.processing_times)[-3:])
+            overall_avg = mean(self.processing_times)
+            trend_factor = recent_avg / overall_avg
+            avg_time *= trend_factor
+        
+        # Calculate remaining time
         remaining_chunks = self.total_chunks - self.completed_chunks
-        estimated_remaining = effective_rate * remaining_chunks
+        estimated_remaining = avg_time * remaining_chunks
+        
+        # Smooth the estimate if we have a previous one
+        if self.last_estimate is not None:
+            estimated_remaining = (estimated_remaining + self.last_estimate) / 2
+        self.last_estimate = estimated_remaining
+        
         completion_percentage = (self.completed_chunks / self.total_chunks) * 100
         
         return avg_time, estimated_remaining, completion_percentage
     
     def get_elapsed_time(self) -> float:
         return time() - self.start_time
+    
+    def get_completion_eta(self) -> Optional[datetime]:
+        """Get estimated completion time."""
+        if self.last_estimate:
+            return datetime.now() + timedelta(seconds=round(self.last_estimate))
+        return None
 
 def setup_logging(log_dir: str = "logs") -> logging.Logger:
     """Setup logging with a single log file."""
@@ -88,240 +140,204 @@ def run_inference(model_name: str, chunk: str, chunk_num: int) -> str:
 class TextProcessor:
     def __init__(self, config: ProcessingConfig):
         self.config = config
-        self.logger = logging.getLogger('proofreader')
+        self.logger = logging.getLogger('formatter')
+        self.state_file = Path(f"state_{datetime.now().strftime('%Y%m%d_%H%M%S')}.json")
+        self.state = None
+
+    def _save_state(self, markdown_chunks: list[str], total_chunks: int, input_file: str, output_file: str):
+        """Save current processing state."""
+        completed = {i: chunk for i, chunk in enumerate(markdown_chunks) if chunk}
+        state = ProcessingState(
+            input_file=str(input_file),
+            output_file=str(output_file),
+            total_chunks=total_chunks,
+            completed_chunks=completed,
+            start_time=time(),
+            config=self.config.__dict__
+        )
+        state.save(self.state_file)
+        self.state = state
 
     def process_chunk(self, chunk: str, chunk_num: int, total_chunks: int) -> Tuple[int, str, float]:
         """Process a single chunk of text."""
         start_time = time()
         
-        html_content = run_inference(
+        markdown_content = run_inference(
             self.config.model_name,
             chunk,
             chunk_num
         )
         
-        if not html_content:
+        if not markdown_content:
             raise ValueError(f"Empty result from chunk {chunk_num}")
+        
+        if not self._validate_markdown(markdown_content):
+            markdown_content = self._fallback_formatting(chunk)
         
         self._log_result(
             chunk_num, 
             total_chunks, 
             chunk, 
-            html_content, 
+            markdown_content, 
             time() - start_time
         )
         
-        return chunk_num - 1, html_content, time() - start_time
+        return chunk_num - 1, markdown_content, time() - start_time
 
-    def _build_prompt(self, chunk: str) -> str:
-        return f"""Convert this text to HTML following these rules:
-1. Lines appearing as main titles become <h1> tags
-2. Lines appearing as subtitles become <h2> tags
-3. Lines starting with > or clear quotations become <blockquote> tags
-4. Lines starting with * or - become <li> tags in a <ul>
-5. Sequential numbered lines (e.g., 1., 2.) become <li> tags in an <ol>; standalone numbers become headings
-6. Indented text or text between --- becomes <div class="verse">
-7. Other text becomes <p> tags
-8. Preserve original text and blank lines
-
-Text:
-{chunk}
-
-Return only the HTML output."""
-
-    def _extract_html(self, generated_text: str, chunk: str, chunk_num: int) -> str:
-        """Extract and validate HTML from model output."""
-        try:
-            # Extract content after the prompt
-            html_content = generated_text.split("TEXT TO CONVERT:")[-1].strip()
-            
-            # Basic validation
-            if not any(tag in html_content.lower() for tag in ['<p>', '<h1>', '<h2>', '<blockquote>', '<div', '<ul>', '<ol>']):
-                self.logger.warning(f"No HTML tags in chunk {chunk_num}, using enhanced fallback")
-                return self._enhanced_formatting(chunk)
-
-            # Fix common issues
-            html_content = self._fix_common_issues(html_content)
-            
-            return html_content
-        except Exception as e:
-            self.logger.warning(f"Failed to extract HTML from chunk {chunk_num}: {str(e)}")
-            return self._enhanced_formatting(chunk)
-
-    def _fix_common_issues(self, html: str) -> str:
-        """Fix common formatting issues in generated HTML."""
-        fixes = [
-            (r'\n{2,}', '\n'),  # Multiple newlines to single
-            (r'<p>\s*</p>', ''),  # Empty paragraphs
-            (r'(?<!>)\n(?!<)', ' '),  # Newlines within tags to spaces
-            (r'<(p|h1|h2|blockquote)>([\s]*)</', r'<\1>No content</'),  # Empty tags
-            (r'\s+</li>', '</li>'),  # Extra spaces before list closings
-            (r'<li>\s+', '<li>'),  # Extra spaces after list openings
-        ]
-        
-        result = html
-        for pattern, replacement in fixes:
-            result = re.sub(pattern, replacement, result)
-        return result
-
-    def _enhanced_formatting(self, text: str) -> str:
-        """Enhanced fallback formatting with better structure detection."""
+    def _fallback_formatting(self, text: str) -> str:
+        """Convert text to Markdown as fallback."""
         lines = text.split('\n')
-        html_lines = []
-        current_list = None
-        in_verse = False
+        md_lines = []
         
         for line in lines:
             line = line.strip()
             if not line:
-                if current_list:
-                    html_lines.append(f"</{current_list}>")
-                    current_list = None
-                if in_verse:
-                    html_lines.append("</div>")
-                    in_verse = False
+                md_lines.append('')
                 continue
             
             # Title detection
             if len(line) < 80 and (line.isupper() or line.istitle()):
-                if current_list:
-                    html_lines.append(f"</{current_list}>")
-                    current_list = None
-                html_lines.append(f"<h1>{line}</h1>")
-                continue
-            
-            # List detection
-            if line.startswith(('* ', '- ')):
-                if current_list != 'ul':
-                    if current_list:
-                        html_lines.append(f"</{current_list}>")
-                    html_lines.append("<ul>")
-                    current_list = 'ul'
-                html_lines.append(f"<li>{line[2:].strip()}</li>")
-                continue
-            
-            # Numbered list detection
-            if re.match(r'^\d+\.\s', line):
-                if current_list != 'ol':
-                    if current_list:
-                        html_lines.append(f"</{current_list}>")
-                    html_lines.append("<ol>")
-                    current_list = 'ol'
-                html_lines.append(f"<li>{re.sub(r'^\d+\.\s', '', line)}</li>")
+                md_lines.append(f"# {line}")
                 continue
             
             # Quote detection
             if line.startswith('>'):
-                if current_list:
-                    html_lines.append(f"</{current_list}>")
-                    current_list = None
-                html_lines.append(f"<blockquote>{line[1:].strip()}</blockquote>")
+                md_lines.append(line)  # Already markdown format
                 continue
             
-            # Verse detection
-            if line.startswith(('    ', '\t')) or '---' in line:
-                if not in_verse:
-                    html_lines.append('<div class="verse">')
-                    in_verse = True
-                html_lines.append(line.strip())
+            # List detection
+            if line.startswith(('* ', '- ')):
+                md_lines.append(line)  # Already markdown format
+                continue
+            
+            # Numbered list detection
+            if re.match(r'^\d+\.\s', line):
+                md_lines.append(line)  # Already markdown format
+                continue
+            
+            # Indented text
+            if line.startswith(('    ', '\t')):
+                md_lines.append(f"    {line.lstrip()}")
                 continue
             
             # Regular paragraph
-            if current_list:
-                html_lines.append(f"</{current_list}>")
-                current_list = None
-            if in_verse:
-                html_lines.append("</div>")
-                in_verse = False
-            html_lines.append(f"<p>{line}</p>")
-        
-        # Clean up any open tags
-        if current_list:
-            html_lines.append(f"</{current_list}>")
-        if in_verse:
-            html_lines.append("</div>")
+            md_lines.append(line)
             
-        return '\n'.join(html_lines)
+        return '\n\n'.join(md_lines)
 
-    def _log_result(self, chunk_num: int, total_chunks: int, chunk: str, html_content: str, processing_time: float):
+    def _validate_markdown(self, text: str) -> bool:
+        """Validate that the text contains Markdown formatting."""
+        markdown_patterns = [
+            r'^#+ ',          # Headers
+            r'^\* ',          # Unordered lists
+            r'^\d+\. ',       # Ordered lists
+            r'^> ',           # Blockquotes
+            r'    ',          # Indented code/verse
+            r'\*\*.*\*\*',    # Bold
+            r'\*[^\*]+\*'     # Italic
+        ]
+        return any(re.search(pattern, text, re.MULTILINE) for pattern in markdown_patterns)
+
+    def _log_result(self, chunk_num: int, total_chunks: int, chunk: str, markdown_content: str, processing_time: float):
         """Log processing results."""
         self.logger.debug(
             f"Chunk {chunk_num}/{total_chunks}\n"
-            f"Input length: {len(chunk)}, Output length: {len(html_content)}\n"
+            f"Input length: {len(chunk)}, Output length: {len(markdown_content)}\n"
             f"Time: {processing_time:.2f}s\n"
-            f"Output:\n{html_content}\n"
+            f"Output:\n{markdown_content}\n"
             f"{'-'*40}"
         )
 
-    def _handle_error(self, chunk: str, chunk_num: int, total_chunks: int, error: Exception, start_time: float) -> Tuple[int, str, float]:
-        processing_time = time() - start_time
-        fallback_content = f'<p>{html.escape(chunk)}</p>'
-        self.logger.error(f"Chunk {chunk_num}/{total_chunks} failed: {str(error)}")
-        return chunk_num - 1, fallback_content, processing_time
-
 def format_time(seconds: float) -> str:
-    return str(timedelta(seconds=round(seconds)))
+    return str(timedelta(seconds=round(seconds)))  # Fixed syntax: seconds=round(seconds)
 
-def text_to_html(input_file: str, output_file: str, config: Optional[ProcessingConfig] = None) -> None:
-    """Convert text file to HTML."""
+def text_to_markdown(input_file: str, output_file: str, config: Optional[ProcessingConfig] = None, 
+                    resume_file: Optional[str] = None, force_restart: bool = False) -> None:
+    """Convert text file to Markdown with resume capability."""
     config = config or ProcessingConfig()
     logger = setup_logging()
     processor = TextProcessor(config)
     
-    logger.info(f"Converting {input_file} to HTML")
-    
-    css_styles = """
-    <style>
-        body { font-family: 'Georgia', serif; max-width: 800px; margin: 0 auto; padding: 20px; line-height: 1.6; color: #333; }
-        h1 { font-size: 2.5em; color: #2c3e50; border-bottom: 2px solid #3498db; padding-bottom: 10px; margin-bottom: 20px; }
-        h2 { font-size: 1.8em; color: #34495e; margin: 30px 0 15px; }
-        p { margin: 15px 0; text-align: justify; }
-        ul, ol { margin: 15px 0 15px 40px; padding-left: 0; }
-        li { margin: 10px 0; }
-        blockquote { margin: 20px 0; padding: 15px 20px; background: #f8f9fa; border-left: 5px solid #3498db; font-style: italic; color: #555; }
-        .verse { margin: 20px 0; padding: 15px; background: #f0f4f8; border-radius: 5px; font-family: 'Courier New', monospace; white-space: pre-wrap; }
-    </style>
-    """
-    
-    text = Path(input_file).read_text(encoding='utf-8')
-    chunks = split_into_chunks(text, config.chunk_size)
+    # Handle resume/restart
+    if resume_file and not force_restart:
+        try:
+            state_path = Path(resume_file)
+            if state_path.exists():
+                state = ProcessingState.load(state_path)
+                logger.info(f"Resuming from state file: {resume_file}")
+                markdown_chunks = [''] * state.total_chunks
+                for idx, content in state.completed_chunks.items():
+                    markdown_chunks[idx] = content
+                chunks = split_into_chunks(Path(state.input_file).read_text(encoding='utf-8'), 
+                                        config.chunk_size)
+                start_idx = len(state.completed_chunks)
+                processor.state = state
+                processor.state_file = state_path
+            else:
+                logger.warning(f"State file not found: {resume_file}")
+                chunks = split_into_chunks(Path(input_file).read_text(encoding='utf-8'), 
+                                        config.chunk_size)
+                markdown_chunks = [''] * len(chunks)
+                start_idx = 0
+        except Exception as e:
+            logger.error(f"Failed to load state: {e}")
+            chunks = split_into_chunks(Path(input_file).read_text(encoding='utf-8'), 
+                                    config.chunk_size)
+            markdown_chunks = [''] * len(chunks)
+            start_idx = 0
+    else:
+        chunks = split_into_chunks(Path(input_file).read_text(encoding='utf-8'), 
+                                config.chunk_size)
+        markdown_chunks = [''] * len(chunks)
+        start_idx = 0
     
     if not chunks:
         raise ValueError(f"No valid text chunks found in {input_file}")
     
-    html_chunks = [''] * len(chunks)
-    time_tracker = ChunkTimeTracker(len(chunks), 1)  # Single worker
+    time_tracker = ChunkTimeTracker(len(chunks), 1)
+    
+    # Save initial state
+    processor._save_state(markdown_chunks, len(chunks), input_file, output_file)
     
     # Process chunks sequentially
-    for i, chunk in enumerate(chunks):
-        chunk_idx, html_content, processing_time = processor.process_chunk(chunk, i+1, len(chunks))
-        html_chunks[chunk_idx] = html_content
-        
-        avg_time, remaining_time, completion_percentage = time_tracker.add_chunk_time(processing_time)
-        logger.info(f"Chunk {chunk_idx + 1}/{len(chunks)} ({completion_percentage:.1f}%) - "
-                   f"Avg: {format_time(avg_time)}, Remaining: {format_time(remaining_time)}")
+    for i in range(start_idx, len(chunks)):
+        try:
+            chunk_idx, content, processing_time = processor.process_chunk(chunks[i], i+1, len(chunks))
+            markdown_chunks[chunk_idx] = content
+            
+            # Save state after each chunk
+            processor._save_state(markdown_chunks, len(chunks), input_file, output_file)
+            
+            avg_time, remaining_time, completion_percentage = time_tracker.add_chunk_time(processing_time)
+            eta = time_tracker.get_completion_eta()
+            eta_str = f", ETA: {eta.strftime('%H:%M:%S')}" if eta else ""
+            logger.info(
+                f"Chunk {chunk_idx + 1}/{len(chunks)} ({completion_percentage:.1f}%) - "
+                f"Avg: {format_time(avg_time)}, Remaining: {format_time(remaining_time)}{eta_str}"
+            )
+            
+        except KeyboardInterrupt:
+            logger.info("\nProcessing interrupted. State saved - use --resume to continue later.")
+            return
+        except Exception as e:
+            logger.error(f"Error processing chunk {i+1}: {e}")
+            logger.info("State saved - use --resume to continue later.")
+            raise
     
-    if any(not chunk for chunk in html_chunks):
+    if any(not chunk for chunk in markdown_chunks):
         raise ValueError("Some chunks failed to process")
     
-    html_content = fix_chunk_boundaries(html_chunks)
+    # Join chunks with double newlines for clear section separation
+    markdown_content = '\n\n'.join(markdown_chunks)
     
-    html_content = f"""<!DOCTYPE html>
-<html lang="en">
-<head>
-    <meta charset="UTF-8">
-    <meta name="viewport" content="width=device-width, initial-scale=1.0">
-    <title>Formatted Document</title>
-    {css_styles}
-</head>
-<body>
-    {html_content}
-</body>
-</html>"""
+    # Ensure output file has .md extension
+    if not output_file.endswith('.md'):
+        output_file = Path(output_file).with_suffix('.md')
     
     Path(output_file).parent.mkdir(parents=True, exist_ok=True)
     with open(output_file, 'w', encoding='utf-8') as f:
-        f.write(html_content)
+        f.write(markdown_content)
+    
     logger.info(f"Generated {output_file} in {format_time(time_tracker.get_elapsed_time())}")
 
 def split_into_chunks(text: str, chunk_size: int) -> list[str]:
@@ -356,18 +372,37 @@ def split_into_chunks(text: str, chunk_size: int) -> list[str]:
     return chunks
 
 def fix_chunk_boundaries(chunks: list[str]) -> str:
-    """Fix HTML tags across chunk boundaries."""
-    combined = '\n'.join(chunks)
-    combined = combined.replace('</p>\n<p>', '\n')
-    combined = combined.replace('</ul>\n<ul>', '\n')
-    combined = combined.replace('</ol>\n<ol>', '\n')
-    combined = combined.replace('</blockquote>\n<blockquote>', '\n')
-    combined = combined.replace('</div>\n<div class="verse">', '\n')
-    return combined
+    """Fix Markdown chunk boundaries."""
+    # Join chunks with double newlines
+    return '\n\n'.join(chunk.strip() for chunk in chunks)
 
 if __name__ == "__main__":
-    logger = setup_logging()
-    print("Processing log: " + str(Path(logger.handlers[0].baseFilename)))
+    parser = argparse.ArgumentParser(description='Convert text to Markdown with resume capability')
+    parser.add_argument('--input', '-i', 
+                       default="texts/text.txt",
+                       help='Input text file (default: texts/text.txt)')
+    parser.add_argument('--output', '-o', 
+                       default="output.md",
+                       help='Output markdown file (default: output.md)')
+    parser.add_argument('--resume', '-r',
+                       help='Resume from state file')
+    parser.add_argument('--restart',
+                       action='store_true',
+                       help='Force restart, ignore existing state')
     
+    args = parser.parse_args()
+    logger = setup_logging()
     config = ProcessingConfig()
-    text_to_html("texts/text.txt", "output.html", config)
+    
+    # Create texts directory if it doesn't exist
+    Path("texts").mkdir(exist_ok=True)
+    
+    try:
+        text_to_markdown(args.input, args.output, config, args.resume, args.restart)
+    except FileNotFoundError:
+        logger.error(f"Input file not found: {args.input}")
+        logger.info(f"Please place your input file in: {Path(args.input).absolute()}")
+        sys.exit(1)
+    except Exception as e:
+        logger.error(f"Processing failed: {e}")
+        sys.exit(1)

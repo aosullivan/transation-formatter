@@ -1,5 +1,6 @@
 import torch
 import os
+import re  # Add missing import
 import logging
 import shutil
 from time import time
@@ -22,54 +23,60 @@ if 'HF_TOKEN' not in os.environ:
     if (env_path.exists()):
         load_dotenv(str(env_path))
 
-HTML_CONVERSION_PROMPT = """Convert the following text from a Gutenberg.org text file into valid, well-formed HTML. Follow these formatting rules strictly to produce clean, semantic HTML output. Use the text’s structure (e.g., blank lines, indentation, prefixes) to determine the correct tags.
+HTML_CONVERSION_PROMPT = """Convert the following text into clean, semantic Markdown format. Follow these formatting rules strictly:
 
 FORMATTING RULES:
-1. Main titles (e.g., chapter titles, section starts, all-caps or centered text) -> <h1>Title</h1>
-2. Subtitles or secondary headings (e.g., title case text followed by a blank line) -> <h2>Subtitle</h2>
-3. Quotations (lines starting with '>') -> <blockquote>Quote</blockquote>. Use <br> for internal line breaks.
-4. Unordered lists (lines starting with '*' or '-') -> Group into <ul><li>Item</li></ul>. Each line is a separate <li>.
-5. Ordered lists (lines starting with '1.', '2.', etc.) -> Group into <ol><li>Item</li></ol>. Each line is a separate <li>. Let HTML handle numbering.
-6. Indented text or text between '---' lines -> <div class="verse">Text</div>. Use <br> for internal line breaks.
-7. All other paragraphs (blocks of text separated by blank lines) -> <p>Text</p>. Keep paragraphs intact unless separated by a blank line.
-8. Preserve meaningful line breaks and spacing:
-   - Use <br> for intentional line breaks within blockquotes, verses, or paragraphs.
-   - Avoid extra whitespace or tags between elements.
-9. Every line of text must be wrapped in an HTML tag based on its context. No untagged text.
-10. Ensure valid HTML:
-    - Nest and close all tags correctly.
-    - Wrap the full output in <html><body>...</body></html>.
+1. Main titles (chapter titles, section starts) -> # Title
+2. Subtitles or secondary headings -> ## Subtitle
+3. Quotations -> Use > for quotes
+4. Unordered lists -> Use * or -
+5. Ordered lists (multiple lines with numbers forming a sequence) -> 1. First item (keep original numbers)
+6. Indented text or text between --- -> Indent with 4 spaces or use ``` for code blocks
+7. Regular paragraphs -> Plain text, separated by blank lines
+8. Preserve meaningful line breaks using double spaces at line ends
+9. Keep original text structure (blank lines, indentation)
+10. Special formatting:
+    - *italic* for emphasis
+    - **bold** for strong emphasis
+    - `code` for inline code
+    - --- for horizontal rules
 
 EXAMPLE:
 INPUT:
 CHAPTER I
 Introduction
-> This is a quote
-> spanning two lines
+  This is a quote
+  spanning lines
 1. First item
 2. Second item
   Indented text line 1
   Indented text line 2
-Regular paragraph text
+Regular text
 
 OUTPUT:
-<html><body>
-<h1>CHAPTER I</h1>
-<h2>Introduction</h2>
-<blockquote>This is a quote<br>spanning two lines</blockquote>
-<ol><li>First item</li><li>Second item</li></ol>
-<div class="verse">Indented text line 1<br>Indented text line 2</div>
-<p>Regular paragraph text</p>
-</body></html>
+# CHAPTER I
+
+## Introduction
+
+> This is a quote
+> spanning lines
+
+1. First item
+2. Second item
+
+    Indented text line 1
+    Indented text line 2
+
+Regular text
 
 TEXT TO CONVERT:
 {text}
 
 INSTRUCTIONS:
-- Analyze the input text’s structure to apply the correct tags (e.g., blank lines separate paragraphs, indentation signals verses).
-- Group related lines into single HTML elements (e.g., consecutive list items in one <ul> or <ol>).
-- Return only valid HTML. Do not include explanations, comments, or text outside the HTML structure.
-- If a line’s purpose is unclear, wrap it in <p> tags as a default."""
+- Analyze text structure to apply appropriate Markdown syntax
+- Preserve original text formatting where Markdown allows
+- Return clean Markdown without explanations or extra formatting
+- Use standard Markdown symbols (# for headings, > for quotes, etc.)"""
 
 def get_hf_cache_dir() -> Path:
     """Get the Hugging Face cache directory."""
@@ -114,11 +121,12 @@ class LLMInference:
         self.device = "mps" if torch.backends.mps.is_available() else "cpu"
         self.logger.info(f"Initializing LLM with model: {model_name} on device: {self.device}")
         
-        self.token = token or os.getenv('HF_TOKEN')
+        # Simplified token handling - environment variable takes precedence
+        self.token = os.getenv('HF_TOKEN') or token
         if not self.token:
             raise ValueError("HuggingFace token not found")
         
-        login(self.token)
+        # Removed login() call since we'll use token directly in from_pretrained
         
         # Get model from singleton manager
         self.tokenizer, self.model, self.pipe = ModelManager.get_model(model_name, self.token)
@@ -131,7 +139,7 @@ class LLMInference:
     def run_inference(self, text: str) -> str:
         if not text or not text.strip():
             raise ValueError("Empty text provided for inference")
-        
+            
         self.logger.info(f"Running inference on text of length: {len(text)}")
         start_time = time()
         
@@ -145,18 +153,17 @@ class LLMInference:
             repetition_penalty=1.2
         )[0]['generated_text']
         
-        html_content = result.split("TEXT TO CONVERT:")[-1].strip()
+        markdown_content = result.split("TEXT TO CONVERT:")[-1].strip()
         processing_time = time() - start_time
         self.logger.info(f"Inference completed in {processing_time:.2f}s")
         
-        # Extract HTML content
-        html_content = result.split("TEXT TO CONVERT:")[-1].strip()
-        
-        if not html_content:
+        if not markdown_content:
             raise ValueError("Model returned empty response")
-            
-        if not any(tag in html_content.lower() for tag in ['<p>', '<h1>', '<h2>', '<blockquote>', '<div', '<ul>', '<ol>']):
-            raise ValueError("Model response contains no valid HTML tags")
+        
+        # Simplified pattern check for basic Markdown
+        is_markdown = bool(re.search(r'[#>*\-\d\.]|    ', markdown_content))
+        if not is_markdown:
+            self.logger.warning("Response might not be proper Markdown, but proceeding")
         
         self.cleanup()
-        return html_content
+        return markdown_content

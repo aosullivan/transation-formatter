@@ -23,12 +23,11 @@ This is a paragraph.
     result = llm.run_inference(test_text)
     print(f"LLM Output:\n{result}")
     
-    # Add your assertions here
-    assert "<h1>" in result
-    assert "<p>" in result
-    assert "<blockquote>" in result
-    assert "<ol>" in result
-    assert "<ul>" in result
+    # Update assertions for Markdown
+    assert "# " in result or "## " in result  # Headers
+    assert "> " in result  # Blockquotes
+    assert "1. " in result  # Ordered lists
+    assert "* " in result or "- " in result  # Unordered lists
 
 if __name__ == "__main__":
     test_llm_inference()
